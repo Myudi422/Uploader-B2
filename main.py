@@ -67,7 +67,7 @@ BUCKET_NAME = 'ccgnimex'
 # Konfigurasi Telegram
 API_HASH = "aebd45c2c14b36c2c91dec3cf5e8ee9a"
 APP_ID = 7120601
-BOT_TOKEN = "7291869200:AAH1MnSL49aAJPMdMATfkgM4Rf-YuITPn_A"
+BOT_TOKEN = "5674151043:AAHHhHgn39e4KkXlqwxUrrtacZibMD5p558"
 
 bot = Client("b2_uploader_bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 

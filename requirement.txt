@@ -1,0 +1,6 @@
+rarfile
+pyrogram
+boto3
+python-magic
+gdown
+mysql-connector-python
