@@ -291,7 +291,143 @@ async def handle_gdrivefile(client, message):
                 os.rmdir("temp")
 
     await add_task_to_queue(process_task)
-    
+
+@bot.on_message(filters.command("indexarc"))
+async def handle_indexarc(client, message):
+    logging.info("Command /indexarc diterima")
+
+    async def process_task():
+        try:
+            # Parsing parameter dari pesan
+            params = message.text.split(" ", 1)
+            if len(params) < 2 or "|" not in params[1]:
+                await message.reply("Format tidak valid. Gunakan: /indexarc link_arsip | nama_file.zip/rar | animeid | episodelist")
+                return
+
+            parts = params[1].split("|")
+            if len(parts) < 4:
+                await message.reply("Parameter tidak lengkap. Pastikan menggunakan format: /indexarc link | nama_file | animeid | episodelist")
+                return
+
+            archive_link, archive_name, anime_id, episodelist = map(str.strip, parts)
+
+            if not archive_link or not archive_name or not anime_id or not episodelist:
+                await message.reply("Parameter tidak boleh kosong.")
+                return
+
+            # Validasi format episodelist
+            if not re.match(r"^\d+-\d+$", episodelist):
+                await message.reply("Format episodelist tidak valid. Gunakan format seperti 1-20. Input angka tunggal tidak diperbolehkan.")
+                return
+
+            # Konversi episodelist menjadi rentang angka
+            start_episode, end_episode = map(int, episodelist.split("-"))
+
+            if start_episode > end_episode:
+                await message.reply("Awal episodelist harus lebih kecil atau sama dengan akhir episodelist. Contoh: 1-20.")
+                return
+
+            episode_numbers = list(range(start_episode, end_episode + 1))
+
+            # Tentukan jalur file sementara
+            temp_dir = os.path.join("temp", "archive")
+            os.makedirs(temp_dir, exist_ok=True)
+
+            archive_path = os.path.join(temp_dir, archive_name)
+
+            progress_message = await message.reply("Mengunduh arsip dari link index...")
+
+            # Unduh arsip menggunakan httpx
+            async with httpx.AsyncClient() as client:
+                response = await client.get(archive_link)
+                if response.status_code == 200:
+                    with open(archive_path, "wb") as f:
+                        f.write(response.content)
+                else:
+                    await progress_message.edit_text("Gagal mengunduh arsip. Pastikan link index valid.")
+                    return
+
+            await progress_message.edit_text("Mengekstrak arsip...")
+
+            # Ekstrak arsip
+            extracted_dir = os.path.join(temp_dir, "extracted")
+            os.makedirs(extracted_dir, exist_ok=True)
+
+            if archive_name.endswith(".zip"):
+                with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                    zip_ref.extractall(extracted_dir)
+            elif archive_name.endswith(".rar"):
+                with rarfile.RarFile(archive_path, 'r') as rar_ref:
+                    rar_ref.extractall(extracted_dir)
+            else:
+                await progress_message.edit_text("Format arsip tidak didukung. Hanya .zip dan .rar yang didukung.")
+                return
+
+            # Filter valid video files
+            valid_video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.flv', '.webm']
+
+            numbered_files = []
+            for root, _, files in os.walk(extracted_dir):
+                for file in files:
+                    file_extension = os.path.splitext(file)[1].lower()
+                    if file_extension in valid_video_extensions:
+                        numbered_files.append((os.path.join(root, file), file))
+
+            num_files = len(numbered_files)
+
+            if num_files != len(episode_numbers):
+                await message.reply(f"Jumlah file yang diekstrak ({num_files}) tidak sesuai dengan episodelist ({len(episode_numbers)} episode).")
+                return
+
+            # Sort and rename files sequentially
+            numbered_files.sort(key=lambda x: x[1])
+            renamed_files = []
+            for index, (full_path, original_name) in enumerate(numbered_files, start=1):
+                file_extension = os.path.splitext(original_name)[1]
+                new_name = f"{str(index).zfill(2)}{file_extension}"
+                new_path = os.path.join(os.path.dirname(full_path), new_name)
+                os.rename(full_path, new_path)
+                renamed_files.append(new_path)
+
+            # Masukkan data ke database
+            for episode_number, file_path in zip(episode_numbers, renamed_files):
+                relative_path = os.path.relpath(file_path, extracted_dir)
+                video_url = upload_file_to_s3(file_path, BUCKET_NAME, relative_path)
+                insert_into_sql(anime_id, episode_number, f"Episode {episode_number}", video_url)
+
+            # Hapus file sementara
+            os.remove(archive_path)
+            for root, _, files in os.walk(temp_dir, topdown=False):
+                for name in files:
+                    os.remove(os.path.join(root, name))
+                os.rmdir(root)
+
+            await progress_message.edit_text("Semua episode berhasil diproses dan dimasukkan ke database!")
+
+            # Kirim data anime_id ke server
+            url = "https://ccgnimex.my.id/v2/android/scrapping/index.php"
+            data = {"anime_id": anime_id}
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(url, data=data)
+                    if response.status_code == 200:
+                        await message.reply(f"Anime ID {anime_id} berhasil ditambahkan ke server!")
+                    else:
+                        await message.reply(f"Gagal menambahkan Anime ID {anime_id}. Server mengembalikan kode status {response.status_code}")
+            except Exception as e:
+                await message.reply(f"Terjadi kesalahan saat menambahkan Anime ID {anime_id}: {str(e)}")
+        except Exception as e:
+            await message.reply(f"Terjadi kesalahan: {e}")
+        finally:
+            if os.path.exists("temp"):
+                for root, _, files in os.walk("temp", topdown=False):
+                    for name in files:
+                        os.remove(os.path.join(root, name))
+                    os.rmdir(root)
+
+    await add_task_to_queue(process_task)
+        
 
 @bot.on_message(filters.command("gdrivearc"))
 async def handle_gdrivearc(client, message):
@@ -431,7 +567,198 @@ async def handle_gdrivearc(client, message):
     await add_task_to_queue(process_task)
 
 
+@bot.on_message(filters.command("gdrivemp4"))
+async def handle_gdrivemp4(client, message):
+    logging.info("Command /gdrivemp4 diterima")
 
+    async def process_task():
+        try:
+            # Parsing parameter dari pesan
+            params = message.text.split(" ", 1)
+            if len(params) < 2 or "|" not in params[1]:
+                await message.reply("Format tidak valid. Gunakan: /gdrivemp4 link_google_drive | nama_file.mp4 | animeid | episodelist")
+                return
+
+            parts = params[1].split("|")
+            if len(parts) < 4:
+                await message.reply("Parameter tidak lengkap. Pastikan menggunakan format: /gdrivemp4 link | nama_file | animeid | episodelist")
+                return
+
+            drive_link, file_name, anime_id, episodelist = map(str.strip, parts)
+
+            if not drive_link or not file_name or not anime_id or not episodelist:
+                await message.reply("Parameter tidak boleh kosong.")
+                return
+
+            # Validasi format episodelist
+            if not re.match(r"^\d+-\d+$", episodelist):
+                await message.reply("Format episodelist tidak valid. Gunakan format seperti 1-20. Input angka tunggal tidak diperbolehkan.")
+                return
+
+            # Konversi episodelist menjadi rentang angka
+            start_episode, end_episode = map(int, episodelist.split("-"))
+
+            if start_episode > end_episode:
+                await message.reply("Awal episodelist harus lebih kecil atau sama dengan akhir episodelist. Contoh: 1-20.")
+                return
+
+            episode_numbers = list(range(start_episode, end_episode + 1))
+
+            # Konversi link jika perlu
+            drive_link = convert_drive_link(drive_link)
+            logging.info(f"Link Google Drive setelah konversi: {drive_link}")
+
+            # Dapatkan ID file dari link Google Drive
+            file_id = re.search(r"id=([a-zA-Z0-9_-]+)", drive_link).group(1)
+
+            # Tentukan jalur file sementara
+            temp_dir = os.path.join("temp", "mp4")
+            os.makedirs(temp_dir, exist_ok=True)
+
+            file_path = os.path.join(temp_dir, file_name)
+
+            progress_message = await message.reply("Mengunduh file MP4 dari Google Drive...")
+
+            # Unduh file MP4 menggunakan gdown
+            gdown.download(f"https://drive.google.com/uc?id={file_id}", file_path, quiet=False)
+
+            # Pastikan file terunduh dengan ekstensi .mp4
+            if not file_name.endswith(".mp4"):
+                await message.reply("Format file tidak valid. Hanya file .mp4 yang didukung.")
+                return
+
+            # Masukkan data ke database
+            for episode_number in episode_numbers:
+                relative_path = os.path.relpath(file_path, temp_dir)
+                video_url = upload_file_to_s3(file_path, BUCKET_NAME, f"{anime_id}/Episode_{episode_number}.mp4")
+                insert_into_sql(anime_id, episode_number, f"Episode {episode_number}", video_url)
+
+            # Hapus file sementara
+            os.remove(file_path)
+            os.rmdir(temp_dir)
+
+            await progress_message.edit_text("File MP4 berhasil diproses dan dimasukkan ke database!")
+
+            # Kirim data anime_id ke server
+            url = "https://ccgnimex.my.id/v2/android/scrapping/index.php"
+            data = {"anime_id": anime_id}
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(url, data=data)
+                    if response.status_code == 200:
+                        await message.reply(f"Anime ID {anime_id} berhasil ditambahkan ke server!")
+                    else:
+                        await message.reply(f"Gagal menambahkan Anime ID {anime_id}. Server mengembalikan kode status {response.status_code}")
+            except Exception as e:
+                await message.reply(f"Terjadi kesalahan saat menambahkan Anime ID {anime_id}: {str(e)}")
+        except Exception as e:
+            await message.reply(f"Terjadi kesalahan: {e}")
+        finally:
+            if os.path.exists("temp"):
+                for root, _, files in os.walk("temp", topdown=False):
+                    for name in files:
+                        os.remove(os.path.join(root, name))
+                    os.rmdir(root)
+
+    await add_task_to_queue(process_task)
+
+
+@bot.on_message(filters.command("indexmp4"))
+async def handle_indexmp4(client, message):
+    logging.info("Command /indexmp4 diterima")
+
+    async def process_task():
+        try:
+            # Parsing parameter dari pesan
+            params = message.text.split(" ", 1)
+            if len(params) < 2 or "|" not in params[1]:
+                await message.reply("Format tidak valid. Gunakan: /indexmp4 link_index | nama_file.mp4 | animeid | episodelist")
+                return
+
+            parts = params[1].split("|")
+            if len(parts) < 4:
+                await message.reply("Parameter tidak lengkap. Pastikan menggunakan format: /indexmp4 link | nama_file | animeid | episodelist")
+                return
+
+            index_link, file_name, anime_id, episodelist = map(str.strip, parts)
+
+            if not index_link or not file_name or not anime_id or not episodelist:
+                await message.reply("Parameter tidak boleh kosong.")
+                return
+
+            # Validasi format episodelist
+            if not re.match(r"^\d+-\d+$", episodelist):
+                await message.reply("Format episodelist tidak valid. Gunakan format seperti 1-20. Input angka tunggal tidak diperbolehkan.")
+                return
+
+            # Konversi episodelist menjadi rentang angka
+            start_episode, end_episode = map(int, episodelist.split("-"))
+
+            if start_episode > end_episode:
+                await message.reply("Awal episodelist harus lebih kecil atau sama dengan akhir episodelist. Contoh: 1-20.")
+                return
+
+            episode_numbers = list(range(start_episode, end_episode + 1))
+
+            # Tentukan jalur file sementara
+            temp_dir = os.path.join("temp", "mp4")
+            os.makedirs(temp_dir, exist_ok=True)
+
+            file_path = os.path.join(temp_dir, file_name)
+
+            progress_message = await message.reply("Mengunduh file MP4 dari link index...")
+
+            # Unduh file MP4 menggunakan httpx
+            async with httpx.AsyncClient() as client:
+                response = await client.get(index_link)
+                if response.status_code == 200:
+                    with open(file_path, "wb") as f:
+                        f.write(response.content)
+                else:
+                    await progress_message.edit_text("Gagal mengunduh file. Pastikan link index valid.")
+                    return
+
+            # Pastikan file terunduh dengan ekstensi .mp4
+            if not file_name.endswith(".mp4"):
+                await message.reply("Format file tidak valid. Hanya file .mp4 yang didukung.")
+                return
+
+            # Masukkan data ke database
+            for episode_number in episode_numbers:
+                relative_path = os.path.relpath(file_path, temp_dir)
+                video_url = upload_file_to_s3(file_path, BUCKET_NAME, f"{anime_id}/Episode_{episode_number}.mp4")
+                insert_into_sql(anime_id, episode_number, f"Episode {episode_number}", video_url)
+
+            # Hapus file sementara
+            os.remove(file_path)
+            os.rmdir(temp_dir)
+
+            await progress_message.edit_text("File MP4 berhasil diproses dan dimasukkan ke database!")
+
+            # Kirim data anime_id ke server
+            url = "https://ccgnimex.my.id/v2/android/scrapping/index.php"
+            data = {"anime_id": anime_id}
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(url, data=data)
+                    if response.status_code == 200:
+                        await message.reply(f"Anime ID {anime_id} berhasil ditambahkan ke server!")
+                    else:
+                        await message.reply(f"Gagal menambahkan Anime ID {anime_id}. Server mengembalikan kode status {response.status_code}")
+            except Exception as e:
+                await message.reply(f"Terjadi kesalahan saat menambahkan Anime ID {anime_id}: {str(e)}")
+        except Exception as e:
+            await message.reply(f"Terjadi kesalahan: {e}")
+        finally:
+            if os.path.exists("temp"):
+                for root, _, files in os.walk("temp", topdown=False):
+                    for name in files:
+                        os.remove(os.path.join(root, name))
+                    os.rmdir(root)
+
+    await add_task_to_queue(process_task)
 
 
 
